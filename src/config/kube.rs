@@ -17,14 +17,12 @@
 
 use base64::engine::{general_purpose::STANDARD, Engine};
 
-use hickory_resolver::{config::*, Resolver};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::convert::From;
 use std::env;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::net::IpAddr;
 
 //use crate::certs::{get_cert, get_cert_from_pem, get_key_from_str, get_private_key};
 use super::kubefile::{AuthProvider, ExecProvider};
@@ -38,7 +36,6 @@ pub struct ClusterConf {
     pub server: String,
     pub tls_server_name: Option<String>,
     pub insecure_skip_tls_verify: bool,
-    pub custom_dns_mapping: Option<(String, IpAddr)>, // (hostname, resolved_ip)
 }
 
 impl ClusterConf {
@@ -52,22 +49,19 @@ impl ClusterConf {
             server,
             tls_server_name,
             insecure_skip_tls_verify: true,
-            custom_dns_mapping: None,
         }
     }
 
-    fn new_with_custom_dns(
+    fn new_secure(
         cert: Option<String>,
         server: String,
         tls_server_name: Option<String>,
-        custom_dns_mapping: Option<(String, IpAddr)>,
     ) -> ClusterConf {
         ClusterConf {
             cert,
             server,
             tls_server_name,
             insecure_skip_tls_verify: false,
-            custom_dns_mapping,
         }
     }
 }
@@ -131,19 +125,6 @@ pub struct Config {
     pub clusters: HashMap<String, ClusterConf>,
     pub contexts: BTreeMap<String, super::kubefile::ContextConf>,
     pub users: HashMap<String, UserConf>,
-}
-
-// Helper function to create custom DNS mapping from server URL and TLS server name
-fn create_custom_dns_mapping(server_url: &str, tls_server_name: &str) -> Option<(String, IpAddr)> {
-    let url = reqwest::Url::parse(server_url).ok()?;
-    let proxy_host = url.host_str()?;
-
-    // Resolve the proxy host to its IP address
-    let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default()).ok()?;
-    let response = resolver.lookup_ip(proxy_host).ok()?;
-    let proxy_ip = response.iter().next()?;
-
-    Some((tls_server_name.to_string(), proxy_ip))
 }
 
 // some utility functions
@@ -210,18 +191,12 @@ impl Config {
                                 let mut s = String::new();
                                 br.read_to_string(&mut s).expect("Couldn't read cert");
 
-                                let custom_dns =
-                                    cluster.conf.tls_server_name.as_ref().and_then(|tls_name| {
-                                        create_custom_dns_mapping(&cluster.conf.server, tls_name)
-                                    });
-
                                 cluster_map.insert(
                                     cluster.name.clone(),
-                                    ClusterConf::new_with_custom_dns(
+                                    ClusterConf::new_secure(
                                         Some(s),
                                         cluster.conf.server.clone(),
                                         cluster.conf.tls_server_name.clone(),
-                                        custom_dns,
                                     ),
                                 );
                             }
@@ -243,18 +218,12 @@ impl Config {
                                 ))
                             })?;
 
-                            let custom_dns =
-                                cluster.conf.tls_server_name.as_ref().and_then(|tls_name| {
-                                    create_custom_dns_mapping(&cluster.conf.server, tls_name)
-                                });
-
                             cluster_map.insert(
                                 cluster.name.clone(),
-                                ClusterConf::new_with_custom_dns(
+                                ClusterConf::new_secure(
                                     Some(cert_pem),
                                     cluster.conf.server.clone(),
                                     cluster.conf.tls_server_name.clone(),
-                                    custom_dns,
                                 ),
                             );
                         }
@@ -263,30 +232,19 @@ impl Config {
                         }
                     },
                     (None, None) => {
-                        let custom_dns =
-                            cluster.conf.tls_server_name.as_ref().and_then(|tls_name| {
-                                create_custom_dns_mapping(&cluster.conf.server, tls_name)
-                            });
-
-                        let mut conf = if cluster.conf.skip_tls {
+                        let conf = if cluster.conf.skip_tls {
                             ClusterConf::new_insecure(
                                 None,
                                 cluster.conf.server.clone(),
                                 cluster.conf.tls_server_name.clone(),
                             )
                         } else {
-                            ClusterConf::new_with_custom_dns(
+                            ClusterConf::new_secure(
                                 None,
                                 cluster.conf.server.clone(),
                                 cluster.conf.tls_server_name.clone(),
-                                custom_dns.clone(),
                             )
                         };
-
-                        // For insecure connections, we still want the custom DNS mapping
-                        if cluster.conf.skip_tls && custom_dns.is_some() {
-                            conf.custom_dns_mapping = custom_dns;
-                        }
 
                         cluster_map.insert(cluster.name.clone(), conf);
                     }
@@ -338,11 +296,10 @@ impl Config {
 
         let mut endpoint = reqwest::Url::parse(&cluster.server)?;
 
-        // When using custom DNS mapping, we keep the original hostname in the URL
+        // When using TLS server name, we need to update the endpoint URL to use the TLS server name
         // The DNS resolver will handle mapping it to the correct IP
-        // We also need to ensure we're using the TLS server name for proper hostname
-        if let Some((tls_hostname, _)) = &cluster.custom_dns_mapping {
-            endpoint.set_host(Some(tls_hostname))?;
+        if let Some(ref tls_server_name) = cluster.tls_server_name {
+            endpoint.set_host(Some(tls_server_name))?;
         }
 
         let ca_certs = match &cluster.cert {
@@ -400,7 +357,8 @@ impl Config {
                 user.impersonate_user.clone(),
                 click_conf.connect_timeout_secs,
                 click_conf.read_timeout_secs,
-                cluster.custom_dns_mapping.clone(),
+                cluster.server.clone(),
+                cluster.tls_server_name.clone(),
             )
         })
     }
@@ -533,7 +491,7 @@ bW1EDp3zdHSo1TRJ6V6e6bR64eVaH4QwnNOfpSXY
         assert!(ctx.is_ok());
         let ctx = ctx.unwrap();
 
-        // The original server hostname should be preserved when DNS resolution fails
-        assert!(ctx.endpoint.host_str() == Some("proxy.example.com"));
+        // When TLS server name is provided, the endpoint should use the TLS server name -- custom resolver will resolve to the correct IP
+        assert!(ctx.endpoint.host_str() == Some("api.example.com"));
     }
 }
