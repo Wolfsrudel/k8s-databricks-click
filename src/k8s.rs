@@ -14,6 +14,7 @@
 
 use base64::engine::{general_purpose::STANDARD, Engine};
 use bytes::Bytes;
+use hickory_resolver::{config::*, Resolver};
 use k8s_openapi::{http, List, ListableResource};
 use reqwest::blocking::Client;
 use reqwest::{Certificate, Identity, Url};
@@ -33,6 +34,20 @@ use crate::{
     config::{AuthProvider, ExecAuth, ExecProvider},
     error::{ClickErrNo, ClickError},
 };
+
+// Helper function to create custom DNS mapping from server URL and TLS server name
+// This is called lazily when the client is created
+fn create_custom_dns_mapping(server_url: &str, tls_server_name: &str) -> Option<(String, IpAddr)> {
+    let url = reqwest::Url::parse(server_url).ok()?;
+    let proxy_host = url.host_str()?;
+
+    // Resolve the proxy host to its IP address
+    let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default()).ok()?;
+    let response = resolver.lookup_ip(proxy_host).ok()?;
+    let proxy_ip = response.iter().next()?;
+
+    Some((tls_server_name.to_string(), proxy_ip))
+}
 
 #[derive(Clone)]
 pub enum UserAuth {
@@ -176,7 +191,8 @@ pub struct Context {
     impersonate_user: Option<String>,
     connect_timeout_secs: u32,
     read_timeout_secs: u32,
-    custom_dns_mapping: Option<(String, IpAddr)>,
+    server_url: String,
+    tls_server_name: Option<String>,
 }
 
 impl Context {
@@ -189,7 +205,8 @@ impl Context {
         impersonate_user: Option<String>,
         connect_timeout_secs: u32,
         read_timeout_secs: u32,
-        custom_dns_mapping: Option<(String, IpAddr)>,
+        server_url: String,
+        tls_server_name: Option<String>,
     ) -> Context {
         let (client, client_auth) = Context::get_client(
             &endpoint,
@@ -198,7 +215,8 @@ impl Context {
             None,
             connect_timeout_secs,
             read_timeout_secs,
-            custom_dns_mapping.clone(),
+            &server_url,
+            &tls_server_name,
         );
         // have to create a special client for logs until
         // https://github.com/seanmonstar/reqwest/issues/1380
@@ -210,7 +228,8 @@ impl Context {
             None,
             u32::MAX,
             u32::MAX,
-            custom_dns_mapping.clone(),
+            &server_url,
+            &tls_server_name,
         );
         let client = RefCell::new(client);
         let log_client = RefCell::new(log_client);
@@ -225,10 +244,12 @@ impl Context {
             impersonate_user,
             connect_timeout_secs,
             read_timeout_secs,
-            custom_dns_mapping,
+            server_url,
+            tls_server_name,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_client(
         endpoint: &Url,
         root_cas: Option<Vec<Certificate>>,
@@ -236,7 +257,8 @@ impl Context {
         id: Option<Identity>,
         connect_timeout_secs: u32,
         read_timeout_secs: u32,
-        custom_dns_mapping: Option<(String, IpAddr)>,
+        server_url: &str,
+        tls_server_name: &Option<String>,
     ) -> (Client, Option<UserAuth>) {
         let host = endpoint.host().unwrap();
         let mut client = match host {
@@ -244,10 +266,12 @@ impl Context {
             _ => Client::builder().use_native_tls(),
         };
 
-        // Use custom DNS mapping if we have one
-        if let Some((hostname, ip)) = custom_dns_mapping {
-            // reqwest's resolve method allows mapping specific hostnames to IP addresses
-            client = client.resolve(&hostname, SocketAddr::new(ip, 443));
+        // Create custom DNS mapping if we have a TLS server name
+        if let Some(tls_name) = tls_server_name {
+            if let Some((hostname, ip)) = create_custom_dns_mapping(server_url, tls_name) {
+                // reqwest's resolve method allows mapping specific hostnames to IP addresses
+                client = client.resolve(&hostname, SocketAddr::new(ip, 443));
+            }
         }
         let client = match root_cas {
             Some(cas) => {
@@ -306,7 +330,8 @@ impl Context {
                         Some(id.clone()),
                         self.connect_timeout_secs,
                         self.read_timeout_secs,
-                        self.custom_dns_mapping.clone(),
+                        &self.server_url,
+                        &self.tls_server_name,
                     );
                     let (new_log_client, _) = Context::get_client(
                         &self.endpoint,
@@ -315,7 +340,8 @@ impl Context {
                         Some(id),
                         u32::MAX,
                         u32::MAX,
-                        self.custom_dns_mapping.clone(),
+                        &self.server_url,
+                        &self.tls_server_name,
                     );
                     *self.client.borrow_mut() = new_client;
                     *self.log_client.borrow_mut() = new_log_client;
