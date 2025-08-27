@@ -196,7 +196,7 @@ impl Env {
         }
         label
             .chars()
-            .all(|c| (c.is_ascii_lowercase() && c.is_ascii_alphanumeric()) || c == '-')
+            .all(|c| (c.is_ascii_lowercase() || c.is_ascii_digit()) || c == '-')
             && label.chars().next().unwrap().is_ascii_alphanumeric()
             && label.chars().last().unwrap().is_ascii_alphanumeric()
     }
