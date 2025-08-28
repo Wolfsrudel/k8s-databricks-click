@@ -196,7 +196,7 @@ impl Env {
         }
         label
             .chars()
-            .all(|c| (c.is_ascii_lowercase() && c.is_ascii_alphanumeric()) || c == '-')
+            .all(|c| (c.is_ascii_lowercase() || c.is_ascii_digit()) || c == '-')
             && label.chars().next().unwrap().is_ascii_alphanumeric()
             && label.chars().last().unwrap().is_ascii_alphanumeric()
     }
@@ -636,5 +636,33 @@ mod tests {
         let exp4 = env.try_expand_alias("x", Some("x"));
         assert_eq!(exp4.expansion, None);
         assert_eq!(exp4.rest, "x");
+    }
+
+    #[test]
+    fn test_validate_rfc_1123_label() {
+        // Valid cases
+        assert!(Env::validate_rfc_1123_label("valid"));
+        assert!(Env::validate_rfc_1123_label("valid-name"));
+        assert!(Env::validate_rfc_1123_label("valid-123"));
+        assert!(Env::validate_rfc_1123_label("123-valid"));
+        assert!(Env::validate_rfc_1123_label("a"));
+        assert!(Env::validate_rfc_1123_label("1"));
+        assert!(Env::validate_rfc_1123_label("abc-123-def"));
+
+        // Invalid cases - empty or too long
+        assert!(!Env::validate_rfc_1123_label(""));
+        assert!(!Env::validate_rfc_1123_label(&"a".repeat(64))); // Max length is 63
+
+        // Invalid cases - starts or ends with hyphen
+        assert!(!Env::validate_rfc_1123_label("-invalid"));
+        assert!(!Env::validate_rfc_1123_label("invalid-"));
+        assert!(!Env::validate_rfc_1123_label("-"));
+
+        // Invalid cases - contains uppercase or invalid characters
+        assert!(!Env::validate_rfc_1123_label("Invalid"));
+        assert!(!Env::validate_rfc_1123_label("invalid_name"));
+        assert!(!Env::validate_rfc_1123_label("invalid.name"));
+        assert!(!Env::validate_rfc_1123_label("invalid@name"));
+        assert!(!Env::validate_rfc_1123_label("invalid name"));
     }
 }
