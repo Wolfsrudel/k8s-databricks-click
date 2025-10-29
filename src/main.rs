@@ -51,7 +51,6 @@ extern crate bytes;
 extern crate k8s_openapi;
 extern crate reqwest;
 extern crate url;
-extern crate yasna;
 
 #[macro_use]
 mod command;

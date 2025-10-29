@@ -333,17 +333,12 @@ impl Config {
                     k8suser = K8SUserAuth::with_exec_provider(provider.clone());
                 }
                 UserAuth::KeyCertData(cert_data, key_data) => {
-                    k8suser = K8SUserAuth::from_key_cert_data(
-                        key_data.clone(),
-                        cert_data.clone(),
-                        &endpoint,
-                    );
+                    k8suser = K8SUserAuth::from_key_cert_data(key_data.clone(), cert_data.clone());
                 }
                 UserAuth::KeyCertPath(cert_path, key_path) => {
                     let cert_full_path = get_full_path(cert_path.clone())?;
                     let key_full_path = get_full_path(key_path.clone())?;
-                    k8suser =
-                        K8SUserAuth::from_key_cert(&key_full_path, &cert_full_path, &endpoint);
+                    k8suser = K8SUserAuth::from_key_cert(&key_full_path, &cert_full_path);
                 }
             };
         }

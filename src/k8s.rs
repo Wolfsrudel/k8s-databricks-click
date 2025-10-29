@@ -20,8 +20,6 @@ use reqwest::blocking::Client;
 use reqwest::{Certificate, Identity, Url};
 use serde::Deserialize;
 use std::net::{IpAddr, SocketAddr};
-use url::Host;
-use yasna::models::ObjectIdentifier;
 
 use std::cell::RefCell;
 use std::fmt::Debug;
@@ -80,105 +78,37 @@ impl UserAuth {
         Ok(UserAuth::UserPass(user, pass))
     }
 
-    /// construct an identity from a key and cert. need the endpoint to deceide which kind of
-    /// identity to use since rustls wants something different from nativetls, and we use rustls for
-    /// dns name hosts and native for ip hosts
-    pub fn from_key_cert<P>(key: P, cert: P, endpoint: &Url) -> Result<UserAuth, ClickError>
+    /// construct an identity from a key and cert using PEM format
+    pub fn from_key_cert<P>(key: P, cert: P) -> Result<UserAuth, ClickError>
     where
         PathBuf: From<P>,
     {
         let key_buf = PathBuf::from(key);
         let cert_buf = PathBuf::from(cert);
-        let pkcs12 = Context::use_pkcs12(endpoint);
-        let id = get_id_from_paths(key_buf, cert_buf, pkcs12)?;
+        let id = get_id_from_paths(key_buf, cert_buf)?;
         Ok(UserAuth::Ident(id))
     }
 
     /// same as above, but use already read data. The data should be base64 encoded pems
-    pub fn from_key_cert_data(
-        key: String,
-        cert: String,
-        endpoint: &Url,
-    ) -> Result<UserAuth, ClickError> {
+    pub fn from_key_cert_data(key: String, cert: String) -> Result<UserAuth, ClickError> {
         let key_decoded = STANDARD.decode(key)?;
         let cert_decoded = STANDARD.decode(cert)?;
-        let pkcs12 = Context::use_pkcs12(endpoint);
-        let id = get_id_from_data(key_decoded, cert_decoded, pkcs12)?;
+        let id = get_id_from_data(key_decoded, cert_decoded)?;
         Ok(UserAuth::Ident(id))
     }
 }
 
-// convert a pkcs1 der to pkcs8 format
-fn pkcs1to8(pkcs1: &[u8]) -> Vec<u8> {
-    let oid = ObjectIdentifier::from_slice(&[1, 2, 840, 113_549, 1, 1, 1]);
-    yasna::construct_der(|writer| {
-        writer.write_sequence(|writer| {
-            writer.next().write_u32(0);
-            writer.next().write_sequence(|writer| {
-                writer.next().write_oid(&oid);
-                writer.next().write_null();
-            });
-            writer.next().write_bytes(pkcs1);
-        })
-    })
-}
-
-// get the right kind of id
-fn get_id_from_pkcs12(key: Vec<u8>, cert: Vec<u8>) -> Result<Identity, ClickError> {
-    let key_pem = pem::parse(key)?;
-
-    let key_der = match key_pem.tag() {
-        "RSA PRIVATE KEY" => {
-            // pkcs#1 pem, need to convert to pkcs#8
-            pkcs1to8(key_pem.contents())
-        }
-        "PRIVATE KEY" => {
-            // pkcs#8 pem, use as is
-            key_pem.contents().to_vec()
-        }
-        _ => {
-            return Err(ClickError::ConfigFileError(format!(
-                "Unknown key type: {}",
-                key_pem.tag()
-            )));
-        }
-    };
-
-    let cert_pem = pem::parse(cert)?;
-
-    let pfx = p12::PFX::new(cert_pem.contents(), &key_der, None, "", "")
-        .ok_or_else(|| ClickError::ConfigFileError("Could not parse pkcs12 data".to_string()))?;
-
-    let pkcs12der = pfx.to_der();
-
-    Identity::from_pkcs12_der(&pkcs12der, "").map_err(|e| e.into())
-}
-
-fn get_id_from_paths(key: PathBuf, cert: PathBuf, pkcs12: bool) -> Result<Identity, ClickError> {
+fn get_id_from_paths(key: PathBuf, cert: PathBuf) -> Result<Identity, ClickError> {
     let mut key_buf = Vec::new();
     File::open(key)?.read_to_end(&mut key_buf)?;
-    if pkcs12 {
-        let mut cert_buf = Vec::new();
-        File::open(cert)?.read_to_end(&mut cert_buf)?;
-        get_id_from_pkcs12(key_buf, cert_buf)
-    } else {
-        // for from_pem key and cert are in same buffer
-        File::open(cert)?.read_to_end(&mut key_buf)?;
-        Identity::from_pem(&key_buf).map_err(|e| e.into())
-    }
+    // for from_pem key and cert are in same buffer
+    File::open(cert)?.read_to_end(&mut key_buf)?;
+    Identity::from_pem(&key_buf).map_err(|e| e.into())
 }
 
-fn get_id_from_data(
-    mut key: Vec<u8>,
-    mut cert: Vec<u8>,
-    pkcs12: bool,
-) -> Result<Identity, ClickError> {
-    if pkcs12 {
-        get_id_from_pkcs12(key, cert)
-    } else {
-        key.append(&mut cert);
-        Identity::from_pem(&key).map_err(|e| e.into())
-    }
+fn get_id_from_data(mut key: Vec<u8>, mut cert: Vec<u8>) -> Result<Identity, ClickError> {
+    key.append(&mut cert);
+    Identity::from_pem(&key).map_err(|e| e.into())
 }
 
 pub struct Context {
@@ -209,7 +139,6 @@ impl Context {
         tls_server_name: Option<String>,
     ) -> Context {
         let (client, client_auth) = Context::get_client(
-            &endpoint,
             root_cas.clone(),
             auth.clone(),
             None,
@@ -222,7 +151,6 @@ impl Context {
         // https://github.com/seanmonstar/reqwest/issues/1380
         // is resolved
         let (log_client, _) = Context::get_client(
-            &endpoint,
             root_cas.clone(),
             auth,
             None,
@@ -251,7 +179,6 @@ impl Context {
 
     #[allow(clippy::too_many_arguments)]
     fn get_client(
-        endpoint: &Url,
         root_cas: Option<Vec<Certificate>>,
         auth: Option<UserAuth>,
         id: Option<Identity>,
@@ -260,11 +187,7 @@ impl Context {
         server_url: &str,
         tls_server_name: &Option<String>,
     ) -> (Client, Option<UserAuth>) {
-        let host = endpoint.host().unwrap();
-        let mut client = match host {
-            Host::Domain(_) => Client::builder().use_rustls_tls(),
-            _ => Client::builder().use_native_tls(),
-        };
+        let mut client = Client::builder().use_rustls_tls();
 
         // Create custom DNS mapping if we have a TLS server name
         if let Some(tls_name) = tls_server_name {
@@ -304,11 +227,6 @@ impl Context {
         )
     }
 
-    fn use_pkcs12(endpoint: &Url) -> bool {
-        let host = endpoint.host().unwrap();
-        !matches!(host, Host::Domain(_))
-    }
-
     fn handle_exec_provider(&self, exec_provider: &ExecProvider) -> Option<UserAuth> {
         let (auth, was_expired) = exec_provider.get_auth();
         match auth {
@@ -319,12 +237,9 @@ impl Context {
                 ..
             } => {
                 if was_expired {
-                    let pkcs12 = Context::use_pkcs12(&self.endpoint);
                     let id =
-                        get_id_from_data(key_data.into_bytes(), cert_data.into_bytes(), pkcs12)
-                            .unwrap(); // TODO: Handle error
+                        get_id_from_data(key_data.into_bytes(), cert_data.into_bytes()).unwrap(); // TODO: Handle error
                     let (new_client, new_auth) = Context::get_client(
-                        &self.endpoint,
                         self.root_cas.clone(),
                         self.auth.clone().take(),
                         Some(id.clone()),
@@ -334,7 +249,6 @@ impl Context {
                         &self.tls_server_name,
                     );
                     let (new_log_client, _) = Context::get_client(
-                        &self.endpoint,
                         self.root_cas.clone(),
                         self.auth.clone().take(),
                         Some(id),
